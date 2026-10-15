@@ -83,7 +83,8 @@ class Lock {
 
   private:
     char* name;				// for debugging
-    // plus some other stuff you'll need to define
+    Semaphore * mutex; // semaforo binario (inicia en 1)
+    Thread * owner; // hilo que tiene el lock, NULL si esta libre
 };
 
 // The following class defines a "condition variable".  A condition
@@ -135,7 +136,7 @@ class Condition {
 
   private:
     char* name;
-    // plus some other stuff you'll need to define
+    List<Semaphore *> * waiting; // un semaforo por cada hilo que espera
 };
 
 

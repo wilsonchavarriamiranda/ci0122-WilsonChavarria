@@ -18,6 +18,16 @@
 #include "diningph.h"
 
 DiningPh * dp;
+Semaphore * fin; // main espera aqui a que terminen los demas hilos
+
+// Avisa a main que este hilo terminó y lo finaliza, sin que el timer
+// pueda interrumpir entre ambas cosas: asi main siempre es el último
+// hilo vivo cuando NachOS se apaga
+void Terminar() {
+    interrupt->SetLevel( IntOff );
+    fin->V();
+    currentThread->Finish();
+}
 
 void Philo( void * p ) {
 
@@ -44,16 +54,73 @@ void Philo( void * p ) {
         sleep( thinks );
     }
 
+    Terminar();
+
 }
+
+//----------------------------------------------------------------------
+// Problema del agua (H2O), resuelto con un monitor (Lock + Condition)
+//	cH, cO: atomos que llegaron y todavia no estan en una molecula
+//	pH, pO: "pases" de salida, atomos ya enlazados que pueden seguir
+//	El atomo que completa una molecula (2 H y 1 O) la forma: pasa esos
+//	atomos de cH/cO a pH/pO y despierta a los que esperan.
+//----------------------------------------------------------------------
 
 int cO = 0;
 int cH = 0;
-Semaphore * sH;
+int pO = 0;
+int pH = 0;
+int moleculas = 0;
+Lock * agua; // protege todas las variables del agua
+Condition * esperaH; // aqui esperan los H
+Condition * esperaO; // aqui esperan los O
+
+// Debe llamarse con el lock "agua" tomado
+void FormarMolecula( const char * quien, long id ) {
+
+    if ( cH >= 2 && cO >= 1 ) {
+        cH -= 2;
+        cO -= 1;
+        pH += 2;
+        pO += 1;
+        moleculas++;
+        printf( "Molecula #%d de agua formada por el %s %ld\n", moleculas, quien, id );
+        esperaH->Broadcast( agua );
+        esperaO->Broadcast( agua );
+    }
+
+}
 
 void H( void * p ) {
+
+    long id = (long) p;
+
+    agua->Acquire();
+    cH++;
+    FormarMolecula( "H", id );
+    while ( pH == 0 )
+        esperaH->Wait( agua );
+    pH--;
+    agua->Release();
+
+    Terminar();
+
 }
 
 void O( void * p ) {
+
+    long id = (long) p;
+
+    agua->Acquire();
+    cO++;
+    FormarMolecula( "O", id );
+    while ( pO == 0 )
+        esperaO->Wait( agua );
+    pO--;
+    agua->Release();
+
+    Terminar();
+
 }
 
 //----------------------------------------------------------------------
@@ -99,6 +166,10 @@ SimpleThread(void* name)
 //	SimpleThread ourselves.
 //----------------------------------------------------------------------
 
+// Prueba que corre ThreadTest:
+//	1 = hilos simples (SimpleThread)   2 = filosofos   3 = agua (H2O)
+#define PRUEBA 2
+
 void
 ThreadTest()
 {
@@ -106,16 +177,51 @@ ThreadTest()
 
     DEBUG('t', "Entering SimpleTest");
 
-/*
+#if PRUEBA == 2
     dp = new DiningPh();
+    fin = new Semaphore( "fin", 0 );
 
     for ( long k = 0; k < 5; k++ ) {
-        Ph = new Thread( "dp" );
+        char * nombre = new char[ 20 ]; // ~Thread() hace delete[] del nombre
+        sprintf( nombre, "Filosofo %ld", k + 1 );
+        Ph = new Thread( nombre );
         Ph->Fork( Philo, (void *) k );
     }
 
+    for ( int k = 0; k < 5; k++ ) // main espera a los 5 filosofos
+        fin->P();
+
     return;
-*/
+#elif PRUEBA == 3
+    agua = new Lock( "agua" );
+    esperaH = new Condition( "esperaH" );
+    esperaO = new Condition( "esperaO" );
+    fin = new Semaphore( "fin", 0 );
+
+    const int N = 10; // cantidad de moleculas a formar
+    int faltanH = 2 * N, faltanO = N;
+    for ( long k = 0; k < 3 * N; k++ ) {
+        char * nombre = new char[ 20 ]; // ~Thread() hace delete[] del nombre
+        // orden aleatorio, pero exactamente 2N hidrogenos y N oxigenos
+        if ( Random() % ( faltanH + faltanO ) < faltanH ) {
+            faltanH--;
+            sprintf( nombre, "H %ld", k );
+            Ph = new Thread( nombre );
+            Ph->Fork( H, (void *) k );
+        } else {
+            faltanO--;
+            sprintf( nombre, "O %ld", k );
+            Ph = new Thread( nombre );
+            Ph->Fork( O, (void *) k );
+        }
+    }
+
+    for ( int k = 0; k < 3 * N; k++ ) // main espera a los 3N atomos
+        fin->P();
+    printf( "Total: %d moleculas de agua\n", moleculas );
+
+    return;
+#else
     char * threadName;
     Thread * newThread;
     for ( int k=1; k<5; k++ ) {
@@ -130,6 +236,7 @@ ThreadTest()
     SimpleThread( (void*) "Hilo 0" );
 
     currentThread->Finish();
+#endif
 
 }
 

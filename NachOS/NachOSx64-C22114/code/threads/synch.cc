@@ -121,55 +121,91 @@ Semaphore::Destroy()
 #endif
 
 
-// Dummy functions -- so we can compile our later assignments 
-// Note -- without a correct implementation of Condition::Wait(),
-// the test case in the network assignment won't work!
-Lock::Lock(const char* debugName) {
+//----------------------------------------------------------------------
+// Lock
+// 	Un semaforo binario (iniciado en 1) mas el "dueno" del lock.
+//	El dueno permite verificar que solo quien hizo Acquire haga Release,
+//	y que Wait/Signal/Broadcast se llamen con el lock tomado.
+//----------------------------------------------------------------------
 
+Lock::Lock(const char* debugName) {
+    name = (char *) debugName;
+    mutex = new Semaphore( debugName, 1 );
+    owner = NULL;
 }
 
 
 Lock::~Lock() {
-
+    delete mutex;
 }
 
 
 void Lock::Acquire() {
-
+    ASSERT( !isHeldByCurrentThread() ); // pedirlo dos veces seria deadlock
+    mutex->P(); // espera si otro hilo lo tiene
+    owner = currentThread;
 }
 
 
 void Lock::Release() {
-
+    ASSERT( isHeldByCurrentThread() ); // solo el dueno lo puede soltar
+    owner = NULL;
+    mutex->V(); // despierta a un hilo que espera, si hay
 }
 
 
 bool Lock::isHeldByCurrentThread() {
-   return false;
+   return owner == currentThread;
 }
 
 
-Condition::Condition(const char* debugName) {
+//----------------------------------------------------------------------
+// Condition
+// 	Cada hilo que hace Wait crea un semaforo propio en 0, lo pone en
+//	la cola "waiting" y duerme.  Signal saca el primero de la cola
+//	y le hace V; Broadcast hace lo mismo con todos.
+//
+//	Si el Signal ocurre entre el Release y el P de Wait, no se pierde:
+//	el semaforo queda en 1 y el P pasa directo.
+//----------------------------------------------------------------------
 
+Condition::Condition(const char* debugName) {
+    name = (char *) debugName;
+    waiting = new List<Semaphore *>;
 }
 
 
 Condition::~Condition() {
-
+    delete waiting;
 }
 
 
 void Condition::Wait( Lock * conditionLock ) {
+    ASSERT( conditionLock->isHeldByCurrentThread() );
 
+    Semaphore * sem = new Semaphore( name, 0 );
+    waiting->Append( sem ); // la cola esta protegida por conditionLock
+
+    conditionLock->Release();
+    sem->P(); // dormir hasta un Signal o Broadcast
+    delete sem;
+    conditionLock->Acquire(); // volver a tomar el lock antes de seguir
 }
 
 
 void Condition::Signal( Lock * conditionLock ) {
+    ASSERT( conditionLock->isHeldByCurrentThread() );
 
+    if ( !waiting->IsEmpty() )
+        waiting->Remove()->V();
 }
 
 
 void Condition::Broadcast( Lock * conditionLock ) {
+    ASSERT( conditionLock->isHeldByCurrentThread() );
+
+    while ( !waiting->IsEmpty() )
+        waiting->Remove()->V();
 }
 
 
