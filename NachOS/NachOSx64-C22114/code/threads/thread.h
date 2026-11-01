@@ -126,6 +126,8 @@ class Thread {
     void RestoreUserState();		// restore user-level register state
 
     AddrSpace *space;			// User code this thread is running.
+    int processId;			// SpaceId of its process
+    int userStackPage;			// Stack given by Fork, -1 if none
 #endif
 };
 

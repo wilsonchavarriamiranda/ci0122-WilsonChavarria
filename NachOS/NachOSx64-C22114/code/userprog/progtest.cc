@@ -32,9 +32,20 @@ StartProcess(const char *filename)
 	return;
     }
 
-    currentThread->space = new AddrSpace(executable);    
+    AddrSpace *space = new AddrSpace(executable);
 
     delete executable;			// close file
+
+    if (!space->IsValid()) {
+	printf("Unable to load %s\n", filename);
+	delete space;
+	return;
+    }
+
+    char *args[] = { (char *) filename };
+    space->SetArguments(1, args);
+    currentThread->space = space;
+    currentThread->processId = processTable->Create();
 
     currentThread->space->InitRegisters();		// set the initial register values
     currentThread->space->RestoreState();		// load page table register

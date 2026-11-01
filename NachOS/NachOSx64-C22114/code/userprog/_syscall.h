@@ -50,6 +50,14 @@
 #define SC_CondBroadcast	23
 
 /*
+ *  Mailbox system calls
+ */
+#define SC_MailboxCreate	24
+#define SC_MailboxDestroy	25
+#define SC_MailboxSend	26
+#define SC_MailboxReceive	27
+
+/*
  *  Socket system calls
  */
 #define SC_Socket	30
@@ -202,6 +210,22 @@ int CondWait( Cond_t condId, Lock_t lockId );
 
 /* CondBroadcast awakes all waiting threads on this variable */
 int CondBroadcast( Cond_t condId, Lock_t lockId );
+
+/*
+ *  NachOS mailboxes
+ */
+typedef int Mailbox_t;
+/* MailboxCreate creates the mailbox for key, or returns it if it already exists */
+Mailbox_t MailboxCreate( int key );
+
+/* MailboxDestroy destroys a mailbox */
+int MailboxDestroy( Mailbox_t mailboxId );
+
+/* MailboxSend sends a message of type > 0, waits if the mailbox is full */
+int MailboxSend( Mailbox_t mailboxId, char * message, int size, int type );
+
+/* MailboxReceive waits for a message of type (0 = any), returns its size */
+int MailboxReceive( Mailbox_t mailboxId, char * message, int size, int type );
 
 /*
  *  NachOS sockets system call family

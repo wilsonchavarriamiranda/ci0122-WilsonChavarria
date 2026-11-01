@@ -18,7 +18,7 @@
 #include "copyright.h"
 #include "filesys.h"
 
-#define UserStackSize		1024 	// increase this as necessary!
+#define UserStackSize		2048 	// increase this as necessary!
 
 class AddrSpace {
   public:
@@ -27,17 +27,29 @@ class AddrSpace {
 					// stored in the file "executable"
     ~AddrSpace();			// De-allocate an address space
 
+    bool IsValid() { return valid; }
+    void SetArguments(int argc, char **argv);
+
     void InitRegisters();		// Initialize user-level CPU registers,
 					// before jumping to user code
+
+    int AllocateStack();
+    void InitThreadRegisters(int func, int firstPage);
 
     void SaveState();			// Save/restore address space-specific
     void RestoreState();		// info on a context switch 
 
   private:
+    void CopyIn(int virtAddr, const char *from, int size);
+
     TranslationEntry *pageTable;	// Assume linear page table translation
 					// for now!
     unsigned int numPages;		// Number of pages in the virtual 
 					// address space
+    bool valid;
+    int argc;
+    int argvAddr;
+    int initialStack;
 };
 
 #endif // ADDRSPACE_H

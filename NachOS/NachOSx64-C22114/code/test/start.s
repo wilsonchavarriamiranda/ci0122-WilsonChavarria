@@ -231,17 +231,17 @@ CondDestroy:
 	j	$31
 	.end CondDestroy
 
-	.globl CondAcquire
-	.ent	CondAcquire
+	.globl CondSignal
+	.ent	CondSignal
 CondSignal:
 	addiu $2,$0,SC_CondSignal
 	addiu $2,$2,SC_User
 	syscall
 	j	$31
-	.end CondAcquire
+	.end CondSignal
 
-	.globl CondSignal
-	.ent	CondSignal
+	.globl CondWait
+	.ent	CondWait
 CondWait:
 	addiu $2,$0,SC_CondWait
 	addiu $2,$2,SC_User
@@ -251,12 +251,48 @@ CondWait:
 
 	.globl CondBroadcast
 	.ent	CondBroadcast
-CondBroadCast:
+CondBroadcast:
 	addiu $2,$0,SC_CondBroadcast
 	addiu $2,$2,SC_User
 	syscall
 	j	$31
 	.end CondBroadcast
+
+	.globl MailboxCreate
+	.ent	MailboxCreate
+MailboxCreate:
+	addiu $2,$0,SC_MailboxCreate
+	addiu $2,$2,SC_User
+	syscall
+	j	$31
+	.end MailboxCreate
+
+	.globl MailboxDestroy
+	.ent	MailboxDestroy
+MailboxDestroy:
+	addiu $2,$0,SC_MailboxDestroy
+	addiu $2,$2,SC_User
+	syscall
+	j	$31
+	.end MailboxDestroy
+
+	.globl MailboxSend
+	.ent	MailboxSend
+MailboxSend:
+	addiu $2,$0,SC_MailboxSend
+	addiu $2,$2,SC_User
+	syscall
+	j	$31
+	.end MailboxSend
+
+	.globl MailboxReceive
+	.ent	MailboxReceive
+MailboxReceive:
+	addiu $2,$0,SC_MailboxReceive
+	addiu $2,$2,SC_User
+	syscall
+	j	$31
+	.end MailboxReceive
 
 	.globl Socket
 	.ent	Socket

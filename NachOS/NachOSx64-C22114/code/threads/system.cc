@@ -34,6 +34,9 @@ SynchDisk   *synchDisk;
 
 #ifdef USER_PROGRAM	// requires either FILESYS or FILESYS_STUB
 Machine *machine;	// user program memory and registers
+BitMap *memoryMap;	// physical page frames in use
+Lock *memoryLock;	// serializes frame allocation
+ProcessTable *processTable;	// running user processes
 #endif
 
 #ifdef NETWORK
@@ -178,6 +181,9 @@ Initialize(int argc, char **argv)
     
 #ifdef USER_PROGRAM
     machine = new Machine(debugUserProg);	// this must come first
+    memoryMap = new BitMap(NumPhysPages);
+    memoryLock = new Lock("memory lock");
+    processTable = new ProcessTable();
 #endif
 
 #ifdef FILESYS
@@ -228,7 +234,8 @@ Cleanup()
 //
     delete stats;
 
-    delete currentThread;
+    if (!strncmp(currentThread->getName(), "main", 4))	// Halt from another thread
+        delete currentThread;
 
     Exit(0);
 }

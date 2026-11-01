@@ -24,11 +24,152 @@
 // Copyright (c) -2026 Universidad de Costa Rica
 
 
+#include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 #include "copyright.h"
 #include "system.h"
 #include "syscall.h"
+#include "addrspace.h"
+#include "nachostabla.h"
+#include "synch.h"
+#include "buzon.h"
 
 #define SC_NachOS	015177
+
+#define MaxPathLength		256
+#define MaxExecArgs		16
+#define MaxKernelObjects	128
+
+
+template <class T>
+class KernelTable {
+  public:
+    KernelTable() { for (int i = 0; i < MaxKernelObjects; i++) items[i] = NULL; }
+
+    int Add(T *item) {
+       for (int i = 0; i < MaxKernelObjects; i++)
+          if (items[i] == NULL) {
+             items[i] = item;
+             return i;
+          }
+       return -1;
+    }
+
+    T *Get(int id) {
+       return (id >= 0 && id < MaxKernelObjects) ? items[id] : NULL;
+    }
+
+    T *Remove(int id) {
+       T *item = Get(id);
+       if (item != NULL)
+          items[id] = NULL;
+       return item;
+    }
+
+  private:
+    T *items[MaxKernelObjects];
+};
+
+static KernelTable<Semaphore> semaphores;
+static KernelTable<Lock> locks;
+static KernelTable<Condition> conditions;
+static KernelTable<Buzon> mailboxes;
+
+
+static bool ValidUserBuffer(int addr, int size, bool writing) {
+   int physAddr;
+
+   for (int i = 0; i < size; i++)
+      if (machine->Translate(addr + i, &physAddr, 1, writing) != NoException)
+         return false;
+   return true;
+}
+
+static void CopyFromUser(int addr, char *into, int size) {
+   int physAddr;
+
+   for (int i = 0; i < size; i++) {
+      machine->Translate(addr + i, &physAddr, 1, false);
+      into[i] = machine->mainMemory[physAddr];
+   }
+}
+
+static void CopyToUser(int addr, const char *from, int size) {
+   int physAddr;
+
+   for (int i = 0; i < size; i++) {
+      machine->Translate(addr + i, &physAddr, 1, true);
+      machine->mainMemory[physAddr] = from[i];
+   }
+}
+
+static bool CopyStringFromUser(int addr, char *into, int size) {
+   int physAddr;
+
+   for (int i = 0; i < size; i++) {
+      if (machine->Translate(addr + i, &physAddr, 1, false) != NoException)
+         return false;
+      into[i] = machine->mainMemory[physAddr];
+      if (into[i] == '\0')
+         return true;
+   }
+   return false;
+}
+
+static void ReturnValue(int value) {
+   machine->WriteRegister(2, value);
+}
+
+static void AdvancePC() {
+   machine->WriteRegister(PrevPCReg, machine->ReadRegister(PCReg));
+   machine->WriteRegister(PCReg, machine->ReadRegister(NextPCReg));
+   machine->WriteRegister(NextPCReg, machine->ReadRegister(NextPCReg) + 4);
+}
+
+static NachosOpenFilesTable * CurrentOpenFiles() {
+   return processTable->getOpenFiles(currentThread->processId);
+}
+
+static int CurrentUnixHandle(int id) {
+   return CurrentOpenFiles()->getUnixHandle(id);
+}
+
+static char * CopyName(const char *name) {
+   char *copy = new char[strlen(name) + 1];
+   strcpy(copy, name);
+   return copy;
+}
+
+static void NachOS_ExitThread(int status) {
+   bool isMainThread = currentThread->userStackPage < 0;
+
+   if (processTable->RemoveThread(currentThread->processId, status, isMainThread))
+      delete currentThread->space;
+   currentThread->space = NULL;
+   currentThread->Finish();
+}
+
+static void KillUserThread(const char *reason, ExceptionType which) {
+   printf("%s exception (%d)\n", reason, which);
+   NachOS_ExitThread(-1);
+}
+
+static void StartUserProcess(void *dummy) {
+   currentThread->space->InitRegisters();
+   currentThread->space->RestoreState();
+   machine->Run();
+}
+
+static void StartUserThread(void *func) {
+   currentThread->space->InitThreadRegisters((long) func, currentThread->userStackPage);
+   currentThread->space->RestoreState();
+   machine->Run();
+}
 
 
 /*
@@ -46,7 +187,7 @@ void NachOS_Halt() {		// System call 0
  *  System call interface: void Exit( int )
  */
 void NachOS_Exit() {		// System call 1
-
+   NachOS_ExitThread(machine->ReadRegister(4));
 }
 
 
@@ -54,6 +195,42 @@ void NachOS_Exit() {		// System call 1
  *  System call interface: SpaceId Exec( char * )
  */
 void NachOS_Exec() {		// System call 2
+   char command[MaxPathLength];
+   char *argv[MaxExecArgs];
+   int argc = 0;
+
+   if (!CopyStringFromUser(machine->ReadRegister(4), command, MaxPathLength)) {
+      ReturnValue(-1);
+      return;
+   }
+
+   for (char *word = strtok(command, " "); word != NULL && argc < MaxExecArgs;
+        word = strtok(NULL, " "))
+      argv[argc++] = word;
+
+   OpenFile *executable = argc > 0 ? fileSystem->Open(argv[0]) : NULL;
+   if (executable == NULL) {
+      ReturnValue(-1);
+      return;
+   }
+
+   AddrSpace *space = new AddrSpace(executable);
+   delete executable;
+
+   int id = space->IsValid() ? processTable->Create() : -1;
+   if (id < 0) {
+      delete space;
+      ReturnValue(-1);
+      return;
+   }
+   space->SetArguments(argc, argv);
+
+   Thread *thread = new Thread(CopyName(argv[0]));
+   thread->space = space;
+   thread->processId = id;
+   thread->Fork(StartUserProcess, NULL);
+
+   ReturnValue(id);
 }
 
 
@@ -61,6 +238,13 @@ void NachOS_Exec() {		// System call 2
  *  System call interface: int Join( SpaceId )
  */
 void NachOS_Join() {		// System call 3
+   int id = machine->ReadRegister(4);
+
+   if (id == currentThread->processId) {
+      ReturnValue(-1);
+      return;
+   }
+   ReturnValue(processTable->Join(id));
 }
 
 
@@ -68,6 +252,15 @@ void NachOS_Join() {		// System call 3
  *  System call interface: void Create( char * )
  */
 void NachOS_Create() {		// System call 4
+   char name[MaxPathLength];
+   int handle = -1;
+
+   if (CopyStringFromUser(machine->ReadRegister(4), name, MaxPathLength))
+      handle = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+
+   if (handle >= 0)
+      close(handle);
+   ReturnValue(handle >= 0 ? 0 : -1);
 }
 
 
@@ -75,6 +268,20 @@ void NachOS_Create() {		// System call 4
  *  System call interface: OpenFileId Open( char * )
  */
 void NachOS_Open() {		// System call 5
+   char name[MaxPathLength];
+   int handle = -1;
+
+   if (CopyStringFromUser(machine->ReadRegister(4), name, MaxPathLength))
+      handle = open(name, O_RDWR);
+   if (handle < 0) {
+      ReturnValue(-1);
+      return;
+   }
+
+   int id = CurrentOpenFiles()->Open(handle);
+   if (id < 0)
+      close(handle);
+   ReturnValue(id);
 }
 
 
@@ -82,6 +289,22 @@ void NachOS_Open() {		// System call 5
  *  System call interface: OpenFileId Write( char *, int, OpenFileId )
  */
 void NachOS_Write() {		// System call 6
+   int buffer = machine->ReadRegister(4);
+   int size = machine->ReadRegister(5);
+   int handle = CurrentUnixHandle(machine->ReadRegister(6));
+
+   if (handle < 0 || size < 0 || !ValidUserBuffer(buffer, size, false)) {
+      ReturnValue(-1);
+      return;
+   }
+
+   char *data = new char[size];
+   CopyFromUser(buffer, data, size);
+   fflush(stdout);
+   int written = write(handle, data, size);
+   delete [] data;
+
+   ReturnValue(written);
 }
 
 
@@ -89,6 +312,22 @@ void NachOS_Write() {		// System call 6
  *  System call interface: OpenFileId Read( char *, int, OpenFileId )
  */
 void NachOS_Read() {		// System call 7
+   int buffer = machine->ReadRegister(4);
+   int size = machine->ReadRegister(5);
+   int handle = CurrentUnixHandle(machine->ReadRegister(6));
+
+   if (handle < 0 || size < 0 || !ValidUserBuffer(buffer, size, true)) {
+      ReturnValue(-1);
+      return;
+   }
+
+   char *data = new char[size];
+   int count = read(handle, data, size);
+   if (count > 0)
+      CopyToUser(buffer, data, count);
+   delete [] data;
+
+   ReturnValue(count);
 }
 
 
@@ -96,6 +335,11 @@ void NachOS_Read() {		// System call 7
  *  System call interface: void Close( OpenFileId )
  */
 void NachOS_Close() {		// System call 8
+   int handle = CurrentOpenFiles()->Close(machine->ReadRegister(4));
+
+   if (handle > ConsoleError)
+      close(handle);
+   ReturnValue(handle >= 0 ? 0 : -1);
 }
 
 
@@ -103,6 +347,24 @@ void NachOS_Close() {		// System call 8
  *  System call interface: void Fork( void (*func)() )
  */
 void NachOS_Fork() {		// System call 9
+   long func = machine->ReadRegister(4);
+   AddrSpace *space = currentThread->space;
+
+   int stackPage = space->AllocateStack();
+   if (stackPage < 0) {
+      ReturnValue(-1);
+      return;
+   }
+
+   processTable->AddThread(currentThread->processId);
+
+   Thread *thread = new Thread(CopyName("forked thread"));
+   thread->space = space;
+   thread->processId = currentThread->processId;
+   thread->userStackPage = stackPage;
+   thread->Fork(StartUserThread, (void *) func);
+
+   ReturnValue(0);
 }
 
 
@@ -110,6 +372,8 @@ void NachOS_Fork() {		// System call 9
  *  System call interface: void Yield()
  */
 void NachOS_Yield() {		// System call 10
+   currentThread->Yield();
+   ReturnValue(0);
 }
 
 
@@ -117,6 +381,18 @@ void NachOS_Yield() {		// System call 10
  *  System call interface: Sem_t SemCreate( int )
  */
 void NachOS_SemCreate() {		// System call 11
+   int initVal = machine->ReadRegister(4);
+
+   if (initVal < 0) {
+      ReturnValue(-1);
+      return;
+   }
+
+   Semaphore *semaphore = new Semaphore("user semaphore", initVal);
+   int id = semaphores.Add(semaphore);
+   if (id < 0)
+      delete semaphore;
+   ReturnValue(id);
 }
 
 
@@ -124,6 +400,10 @@ void NachOS_SemCreate() {		// System call 11
  *  System call interface: int SemDestroy( Sem_t )
  */
 void NachOS_SemDestroy() {		// System call 12
+   Semaphore *semaphore = semaphores.Remove(machine->ReadRegister(4));
+
+   delete semaphore;
+   ReturnValue(semaphore != NULL ? 0 : -1);
 }
 
 
@@ -131,6 +411,11 @@ void NachOS_SemDestroy() {		// System call 12
  *  System call interface: int SemSignal( Sem_t )
  */
 void NachOS_SemSignal() {		// System call 13
+   Semaphore *semaphore = semaphores.Get(machine->ReadRegister(4));
+
+   if (semaphore != NULL)
+      semaphore->V();
+   ReturnValue(semaphore != NULL ? 0 : -1);
 }
 
 
@@ -138,6 +423,11 @@ void NachOS_SemSignal() {		// System call 13
  *  System call interface: int SemWait( Sem_t )
  */
 void NachOS_SemWait() {		// System call 14
+   Semaphore *semaphore = semaphores.Get(machine->ReadRegister(4));
+
+   if (semaphore != NULL)
+      semaphore->P();
+   ReturnValue(semaphore != NULL ? 0 : -1);
 }
 
 
@@ -145,6 +435,12 @@ void NachOS_SemWait() {		// System call 14
  *  System call interface: Lock_t LockCreate( int )
  */
 void NachOS_LockCreate() {		// System call 15
+   Lock *lock = new Lock("user lock");
+   int id = locks.Add(lock);
+
+   if (id < 0)
+      delete lock;
+   ReturnValue(id);
 }
 
 
@@ -152,6 +448,10 @@ void NachOS_LockCreate() {		// System call 15
  *  System call interface: int LockDestroy( Lock_t )
  */
 void NachOS_LockDestroy() {		// System call 16
+   Lock *lock = locks.Remove(machine->ReadRegister(4));
+
+   delete lock;
+   ReturnValue(lock != NULL ? 0 : -1);
 }
 
 
@@ -159,6 +459,14 @@ void NachOS_LockDestroy() {		// System call 16
  *  System call interface: int LockAcquire( Lock_t )
  */
 void NachOS_LockAcquire() {		// System call 17
+   Lock *lock = locks.Get(machine->ReadRegister(4));
+
+   if (lock == NULL || lock->isHeldByCurrentThread()) {
+      ReturnValue(-1);
+      return;
+   }
+   lock->Acquire();
+   ReturnValue(0);
 }
 
 
@@ -166,6 +474,14 @@ void NachOS_LockAcquire() {		// System call 17
  *  System call interface: int LockRelease( Lock_t )
  */
 void NachOS_LockRelease() {		// System call 18
+   Lock *lock = locks.Get(machine->ReadRegister(4));
+
+   if (lock == NULL || !lock->isHeldByCurrentThread()) {
+      ReturnValue(-1);
+      return;
+   }
+   lock->Release();
+   ReturnValue(0);
 }
 
 
@@ -173,6 +489,12 @@ void NachOS_LockRelease() {		// System call 18
  *  System call interface: Cond_t LockCreate( int )
  */
 void NachOS_CondCreate() {		// System call 19
+   Condition *condition = new Condition("user condition");
+   int id = conditions.Add(condition);
+
+   if (id < 0)
+      delete condition;
+   ReturnValue(id);
 }
 
 
@@ -180,6 +502,20 @@ void NachOS_CondCreate() {		// System call 19
  *  System call interface: int CondDestroy( Cond_t )
  */
 void NachOS_CondDestroy() {		// System call 20
+   Condition *condition = conditions.Remove(machine->ReadRegister(4));
+
+   delete condition;
+   ReturnValue(condition != NULL ? 0 : -1);
+}
+
+
+static Condition * CondArguments(Lock **lock) {
+   Condition *condition = conditions.Get(machine->ReadRegister(4));
+   *lock = locks.Get(machine->ReadRegister(5));
+
+   if (*lock == NULL || !(*lock)->isHeldByCurrentThread())
+      return NULL;
+   return condition;
 }
 
 
@@ -187,6 +523,12 @@ void NachOS_CondDestroy() {		// System call 20
  *  System call interface: int CondSignal( Cond_t )
  */
 void NachOS_CondSignal() {		// System call 21
+   Lock *lock;
+   Condition *condition = CondArguments(&lock);
+
+   if (condition != NULL)
+      condition->Signal(lock);
+   ReturnValue(condition != NULL ? 0 : -1);
 }
 
 
@@ -194,6 +536,12 @@ void NachOS_CondSignal() {		// System call 21
  *  System call interface: int CondWait( Cond_t )
  */
 void NachOS_CondWait() {		// System call 22
+   Lock *lock;
+   Condition *condition = CondArguments(&lock);
+
+   if (condition != NULL)
+      condition->Wait(lock);
+   ReturnValue(condition != NULL ? 0 : -1);
 }
 
 
@@ -201,6 +549,94 @@ void NachOS_CondWait() {		// System call 22
  *  System call interface: int CondBroadcast( Cond_t )
  */
 void NachOS_CondBroadcast() {		// System call 23
+   Lock *lock;
+   Condition *condition = CondArguments(&lock);
+
+   if (condition != NULL)
+      condition->Broadcast(lock);
+   ReturnValue(condition != NULL ? 0 : -1);
+}
+
+
+/*
+ *  System call interface: Mailbox_t MailboxCreate( int )
+ */
+void NachOS_MailboxCreate() {		// System call 24
+   int key = machine->ReadRegister(4);
+
+   for (int i = 0; i < MaxKernelObjects; i++)
+      if (mailboxes.Get(i) != NULL && mailboxes.Get(i)->getLlave() == key) {
+         ReturnValue(i);
+         return;
+      }
+
+   Buzon *mailbox = new Buzon(key);
+   int id = mailboxes.Add(mailbox);
+   if (id < 0)
+      delete mailbox;
+   ReturnValue(id);
+}
+
+
+/*
+ *  System call interface: int MailboxDestroy( Mailbox_t )
+ */
+void NachOS_MailboxDestroy() {		// System call 25
+   int id = machine->ReadRegister(4);
+   Buzon *mailbox = mailboxes.Get(id);
+
+   if (mailbox == NULL || mailbox->EnUso()) {
+      ReturnValue(-1);
+      return;
+   }
+   mailboxes.Remove(id);
+   delete mailbox;
+   ReturnValue(0);
+}
+
+
+/*
+ *  System call interface: int MailboxSend( Mailbox_t, char *, int, int )
+ */
+void NachOS_MailboxSend() {		// System call 26
+   Buzon *mailbox = mailboxes.Get(machine->ReadRegister(4));
+   int addr = machine->ReadRegister(5);
+   int size = machine->ReadRegister(6);
+   int type = machine->ReadRegister(7);
+   char message[MAX_MENSAJE];
+
+   if (mailbox == NULL || size < 0 || size > MAX_MENSAJE || type <= 0
+       || !ValidUserBuffer(addr, size, false)) {
+      ReturnValue(-1);
+      return;
+   }
+
+   CopyFromUser(addr, message, size);
+   mailbox->Enviar(message, size, type);
+   ReturnValue(0);
+}
+
+
+/*
+ *  System call interface: int MailboxReceive( Mailbox_t, char *, int, int )
+ */
+void NachOS_MailboxReceive() {		// System call 27
+   Buzon *mailbox = mailboxes.Get(machine->ReadRegister(4));
+   int addr = machine->ReadRegister(5);
+   int size = machine->ReadRegister(6);
+   int type = machine->ReadRegister(7);
+   char message[MAX_MENSAJE];
+
+   if (mailbox == NULL || size < 0 || type < 0 || !ValidUserBuffer(addr, size, true)) {
+      ReturnValue(-1);
+      return;
+   }
+   if (size > MAX_MENSAJE)
+      size = MAX_MENSAJE;
+
+   size = mailbox->Recibir(message, size, type);
+   CopyToUser(addr, message, size);
+   ReturnValue(size);
 }
 
 
@@ -208,6 +644,24 @@ void NachOS_CondBroadcast() {		// System call 23
  *  System call interface: Socket_t Socket( int, int )
  */
 void NachOS_Socket() {			// System call 30
+   int family = machine->ReadRegister(4);
+   int type = machine->ReadRegister(5);
+
+   if (family != AF_INET_NachOS || (type != SOCK_STREAM_NachOS && type != SOCK_DGRAM_NachOS)) {
+      ReturnValue(-1);
+      return;
+   }
+
+   int handle = socket(AF_INET, type == SOCK_STREAM_NachOS ? SOCK_STREAM : SOCK_DGRAM, 0);
+   if (handle < 0) {
+      ReturnValue(-1);
+      return;
+   }
+
+   int id = CurrentOpenFiles()->Open(handle);
+   if (id < 0)
+      close(handle);
+   ReturnValue(id);
 }
 
 
@@ -215,6 +669,21 @@ void NachOS_Socket() {			// System call 30
  *  System call interface: Socket_t Connect( char *, int )
  */
 void NachOS_Connect() {		// System call 31
+   int handle = CurrentUnixHandle(machine->ReadRegister(4));
+   int port = machine->ReadRegister(6);
+   char address[MaxPathLength];
+   int result = -1;
+
+   if (handle >= 0 && CopyStringFromUser(machine->ReadRegister(5), address, MaxPathLength)) {
+      struct sockaddr_in host;
+
+      memset(&host, 0, sizeof(host));
+      host.sin_family = AF_INET;
+      host.sin_port = htons(port);
+      if (inet_pton(AF_INET, address, &host.sin_addr) == 1)
+         result = connect(handle, (struct sockaddr *) &host, sizeof(host));
+   }
+   ReturnValue(result < 0 ? -1 : 0);
 }
 
 
@@ -222,6 +691,20 @@ void NachOS_Connect() {		// System call 31
  *  System call interface: int Bind( Socket_t, int )
  */
 void NachOS_Bind() {		// System call 32
+   int handle = CurrentUnixHandle(machine->ReadRegister(4));
+   int port = machine->ReadRegister(5);
+   int result = -1;
+
+   if (handle >= 0) {
+      struct sockaddr_in host;
+
+      memset(&host, 0, sizeof(host));
+      host.sin_family = AF_INET;
+      host.sin_addr.s_addr = htonl(INADDR_ANY);
+      host.sin_port = htons(port);
+      result = bind(handle, (struct sockaddr *) &host, sizeof(host));
+   }
+   ReturnValue(result < 0 ? -1 : 0);
 }
 
 
@@ -229,6 +712,10 @@ void NachOS_Bind() {		// System call 32
  *  System call interface: int Listen( Socket_t, int )
  */
 void NachOS_Listen() {		// System call 33
+   int handle = CurrentUnixHandle(machine->ReadRegister(4));
+   int backlog = machine->ReadRegister(5);
+
+   ReturnValue(handle >= 0 && listen(handle, backlog) == 0 ? 0 : -1);
 }
 
 
@@ -236,6 +723,18 @@ void NachOS_Listen() {		// System call 33
  *  System call interface: int Accept( Socket_t )
  */
 void NachOS_Accept() {		// System call 34
+   int handle = CurrentUnixHandle(machine->ReadRegister(4));
+   int client = handle < 0 ? -1 : accept(handle, NULL, NULL);
+
+   if (client < 0) {
+      ReturnValue(-1);
+      return;
+   }
+
+   int id = CurrentOpenFiles()->Open(client);
+   if (id < 0)
+      close(client);
+   ReturnValue(id);
 }
 
 
@@ -243,6 +742,15 @@ void NachOS_Accept() {		// System call 34
  *  System call interface: int Shutdown( Socket_t, int )
  */
 void NachOS_Shutdown() {	// System call 25
+   int handle = CurrentUnixHandle(machine->ReadRegister(4));
+   int mode = machine->ReadRegister(5);
+   int how[] = { SHUT_RD, SHUT_WR, SHUT_RDWR };
+
+   if (handle < 0 || mode < 0 || mode > 2) {
+      ReturnValue(-1);
+      return;
+   }
+   ReturnValue(shutdown(handle, how[mode]) == 0 ? 0 : -1);
 }
 
 
@@ -356,6 +864,19 @@ ExceptionHandler(ExceptionType which)
                 NachOS_CondBroadcast();
                 break;
 
+             case SC_MailboxCreate:      // System call # 24
+                NachOS_MailboxCreate();
+                break;
+             case SC_MailboxDestroy:     // System call # 25
+                NachOS_MailboxDestroy();
+                break;
+             case SC_MailboxSend:        // System call # 26
+                NachOS_MailboxSend();
+                break;
+             case SC_MailboxReceive:     // System call # 27
+                NachOS_MailboxReceive();
+                break;
+
              case SC_Socket:	// System call # 30
 		NachOS_Socket();
                break;
@@ -378,43 +899,38 @@ ExceptionHandler(ExceptionType which)
              default:
                 printf("NachOS version: %d-%d\n", (SC_User + SC_NachOS)/10, (SC_Base + SC_NachOS)%10 );
                 printf("Unexpected syscall exception %d\n", type );
-                ASSERT( false );
+                ReturnValue( -1 );
                 break;
           }
+          AdvancePC();
           break;
 
-       case PageFaultException: {
+       case PageFaultException:
+          KillUserThread( "Page fault", which );
           break;
-       }
 
        case ReadOnlyException:
-          printf( "Read Only exception (%d)\n", which );
-          ASSERT( false );
+          KillUserThread( "Read Only", which );
           break;
 
        case BusErrorException:
-          printf( "Bus error exception (%d)\n", which );
-          ASSERT( false );
+          KillUserThread( "Bus error", which );
           break;
 
        case AddressErrorException:
-          printf( "Address error exception (%d)\n", which );
-          ASSERT( false );
+          KillUserThread( "Address error", which );
           break;
 
        case OverflowException:
-          printf( "Overflow exception (%d)\n", which );
-          ASSERT( false );
+          KillUserThread( "Overflow", which );
           break;
 
        case IllegalInstrException:
-          printf( "Ilegal instruction exception (%d)\n", which );
-          ASSERT( false );
+          KillUserThread( "Ilegal instruction", which );
           break;
 
        default:
-          printf( "Unexpected exception %d\n", which );
-          ASSERT( false );
+          KillUserThread( "Unexpected", which );
           break;
     }
 

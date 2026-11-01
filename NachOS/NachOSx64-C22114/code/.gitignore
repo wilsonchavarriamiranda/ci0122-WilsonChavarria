@@ -1,0 +1,11 @@
+# Archivos generados al compilar
+*.o
+*.coff
+nachos
+
+# Ejecutables de los programas de prueba
+/test/*
+!/test/*.c
+!/test/*.s
+!/test/Makefile
+!/test/script
